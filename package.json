@@ -1,0 +1,9 @@
+{
+  "name": "fennec-profile-addon",
+  "version": "0.0.1",
+  "dependencies": {
+    "lodash": "^4.17.4",
+    "node-dir": "^0.1.17",
+    "sysconfx-next": "^1.0.9"
+  }
+}
