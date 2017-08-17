@@ -1,36 +1,32 @@
+#!/usr/bin/env node
+
 const fs = require('fs');
 const child_process = require('child_process');
 const os = require('os');
 const dir = require('node-dir');
 const { basename } = require('path');
 const lodash = require('lodash');
+const mkdirp = require('mkdirp');
 
-const homedir = process.env['HOME']; 
-
-const ADDR_2_LINE = `${homedir}/.mozbuild/android-ndk-r11c/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-addr2line`;
-const OBJDIR = `${homedir}/source/objdirs/objdir-android-opt/dist`;
-const ANDROID_LIBDIR = './remote-libs'; // just 'adb pull /system/lib ./remote-libs'
+const homedir = process.env['HOME'];
+const ADDR2LINE = `${homedir}/.mozbuild/android-ndk-r11c/toolchains/arm-linux-androideabi-4.9/prebuilt/linux-x86_64/bin/arm-linux-androideabi-addr2line`;
 
 let NUM_ADDRESSES_PER_CHUNK = 1000;
 
-let libCache = null;
-
-async function readProfile(profilePath) {
+async function readProfileStream(stream) {
 	// JSON.parse just barfs
 	return new Promise(resolve => {
-		const rs = fs.createReadStream(profilePath);
-
 		let bufs = [];
-		rs.on('data', function(data) {
+		stream.on('data', function(data) {
 			bufs.push(data);
 		});
 
-		rs.on('close', function() {
+		stream.on('close', function() {
 			resolve(JSON.parse(Buffer.concat(bufs)));
 		});
 
-		rs.on('error', function(e) {
-			console.error(e);
+		stream.on('error', function(e) {
+			console.error('Failed to parse profile: ' + e);
 			resolve(null);
 		});
 	});
@@ -53,7 +49,7 @@ function findLib(libs, offset) {
 	return null;
 }
 
-async function buildLibCache() {
+async function buildLibCache(libdir, objdir) {
 	let cache = {};
 
 	const addPaths = function addPaths(paths) {
@@ -63,9 +59,9 @@ async function buildLibCache() {
 	}
 
 	return new Promise(resolve => {
-		dir.paths(OBJDIR, (err, paths) => {
+		dir.paths(objdir, (err, paths) => {
 			addPaths(paths);
-			dir.paths(ANDROID_LIBDIR, (err, paths) => {
+			dir.paths(libdir, (err, paths) => {
 				addPaths(paths);
 				resolve(cache);
 			});
@@ -86,7 +82,7 @@ async function resolveSymbols(path, chunk) {
 	return new Promise(resolve => {
 		let args = ['-e', path, '-f', '-C'];
 		args = args.concat(offsets);
-		let proc = child_process.spawn('addr2line', args);
+		let proc = child_process.spawn(ADDR2LINE, args);
 		
 		let bufs = [];
 		proc.stdout.on('data', data => {
@@ -105,7 +101,7 @@ async function resolveSymbols(path, chunk) {
 	});
 }
 
-async function symbolicateThread(libs, thread) {
+async function symbolicateThread(libCache, libs, thread) {
 	const strings = thread.stringTable;
 	let libOffsets = {};
 
@@ -141,20 +137,25 @@ async function symbolicateThread(libs, thread) {
 
 	let promises = [];
 
-	for (let lib in libOffsets) {
-		let chunks = lodash.chunk(libOffsets[lib], NUM_ADDRESSES_PER_CHUNK);
-		let libPath = await findLibPath(lib);
+	for (const name in libOffsets) {
+		let chunks = lodash.chunk(libOffsets[name], NUM_ADDRESSES_PER_CHUNK);
+		let libPath = libCache[name];
 
 		promises.push(Promise.all(chunks.map(chunk => resolveSymbols(libPath, chunk))));
 	}
 
 	await Promise.all(promises);
 
-	for (let lib in libOffsets) {
-		for (let item of libOffsets[lib]) {
+	for (const name in libOffsets) {
+		for (const item of libOffsets[name]) {
 			strings[item.index] = item.symbol;
 		}
 	}
+}
+
+function getLibPath() {
+	const serial = child_process.execSync('adb shell getprop ro.serialno');
+	return `./remote-libs/${serial}`.trim();
 }
 
 async function main() {
@@ -182,4 +183,46 @@ process.on('unhandledRejection', function(err) {
 	console.error('ERROR: ', err);
 });
 
-main();
+require('yargs')
+	.usage('$0 <cmd> [args]')
+	.command('pull-libs', 'Pull libraries from connected device', function() {
+		const libPath = getLibPath();
+		mkdirp.sync(libPath);
+
+		child_process.spawnSync('adb', ['pull', '/system/lib', libPath], {
+			stdio: ['inherit', 'inherit', 'inherit']
+		});
+	})
+	.command('pull-profile', 'Pull a profile from connected device', {
+		objdir: {
+			default: null,
+			describe: 'Gecko object directory'
+		},
+		output: {
+			default: 'gecko_profile_syms.json',
+			describe: 'Output file name'
+		}
+	}, async function(argv) {
+		if (!argv.objdir) {
+			console.error('Must specify object directory via --objdir');
+			process.exit(1);
+		}
+
+		const pullProcess = child_process.spawn('adb', ['shell', 'cat', '/sdcard/gecko_profile.json']);
+
+		const profile = await readProfileStream(pullProcess.stdout);
+		if (!profile) {
+			console.error('ERROR: failed to read profile');
+			process.exit(1);
+		}
+
+		const libCache = await buildLibCache(getLibPath(), argv.objdir);
+
+		const promises = profile.threads.map(thread => symbolicateThread(libCache, profile.libs, thread));
+		await Promise.all(promises);
+
+		await writeProfile(argv.output, profile);
+		console.log('Wrote symbolicated profile to: ' + argv.output);
+	})
+	.help()
+	.argv;
